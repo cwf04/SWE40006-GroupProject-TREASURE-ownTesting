@@ -1,0 +1,237 @@
+name: CI/CD Pipeline - Build, Test & Deploy
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ---------------------------------------------------------------
+  # CI: lint + unit tests (runs on every push and pull request)
+  # ---------------------------------------------------------------
+  lint-and-test:
+    name: Code Linting and Testing
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        working-directory: ./Online-Convenience-Store-System
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Lint Code with Flake8
+        run: |
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+      - name: Run Unit Tests with Pytest
+        run: |
+          pytest -v
+
+  # ---------------------------------------------------------------
+  # Build: package the app as a Docker image and push to GHCR
+  # ---------------------------------------------------------------
+  build-and-push-docker:
+    name: Container Packaging & Push
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=long
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./Online-Convenience-Store-System
+          file: ./Online-Convenience-Store-System/Dockerfile
+          # Only push from main (pull requests just test the build)
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+
+  # ---------------------------------------------------------------
+  # CD (1/2): TEST stage -> Azure app "YLS-TEST"
+  # ---------------------------------------------------------------
+  deploy-to-test:
+    name: "Deploy to Test (Azure App YLS-TEST)"
+    needs: build-and-push-docker
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: TEST
+
+    steps:
+      - name: Compute lowercase image name
+        run: echo "IMAGE=${{ env.REGISTRY }}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Deploy Container to Azure (test stage)
+        id: deploy
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: 'YLS-TEST'
+          publish-profile: ${{ secrets.TESTING }}
+          images: ${{ env.IMAGE }}:sha-${{ github.sha }}
+
+      - name: Smoke Test (test stage)
+        id: smoke
+        env:
+          APP_URL: ${{ steps.deploy.outputs.webapp-url }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          # Pass only when the NEW build is the one answering (not the old container)
+          for i in $(seq 1 40); do
+            RESP=$(curl -s --max-time 10 "$APP_URL/version" || true)
+            echo "Attempt $i: $RESP"
+            if echo "$RESP" | grep -q "$EXPECTED_SHA"; then
+              curl --fail --silent --show-error "$APP_URL/health"
+              echo "New version $EXPECTED_SHA is live and healthy"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "New version never became healthy"
+          exit 1
+
+      - name: Record deployed image
+        if: ${{ success() }}
+        run: |
+          echo "### Deployed image (test stage)" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ env.IMAGE }}:sha-${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+
+      # --- Automatic rollback: restore the image of the PREVIOUS commit ---
+      # (not :latest, because every build moves :latest to the newest image)
+      - name: Roll back to previous image
+        id: rollback
+        if: ${{ failure() && steps.smoke.outcome == 'failure' && github.event.before != '0000000000000000000000000000000000000000' }}
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: 'YLS-TEST'
+          publish-profile: ${{ secrets.TESTING }}
+          images: ${{ env.IMAGE }}:sha-${{ github.event.before }}
+
+      - name: Verify rollback and record it
+        if: ${{ always() && steps.rollback.outcome == 'success' }}
+        env:
+          APP_URL: ${{ steps.deploy.outputs.webapp-url }}
+        run: |
+          echo "Waiting 45 seconds for Azure to boot the rolled-back container..."
+          sleep 45
+          curl --fail --silent --show-error \
+               --retry 20 --retry-delay 10 --retry-connrefused \
+               "$APP_URL/health"
+          echo "Version after rollback: $(curl -s --max-time 10 "$APP_URL/version" || true)"
+          echo "::warning::Smoke test failed. Rolled back to previous image sha-${{ github.event.before }}"
+          echo "### ROLLED BACK (test stage)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Failed commit: ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Restored image: ${{ env.IMAGE }}:sha-${{ github.event.before }}" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------
+  # CD (2/2): PRODUCTION stage -> Azure app "YLS-PROD"
+  # ---------------------------------------------------------------
+  deploy-to-production:
+    name: "Deploy to Production (Azure App YLS-PROD)"
+    needs: deploy-to-test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: PRODUCTION
+
+    steps:
+      - name: Compute lowercase image name
+        run: echo "IMAGE=${{ env.REGISTRY }}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Deploy Container to Azure (production stage)
+        id: deploy
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: 'YLS-PROD'
+          publish-profile: ${{ secrets.PRODUCTION }}
+          images: ${{ env.IMAGE }}:sha-${{ github.sha }}
+
+      - name: Smoke Test (production stage)
+        id: smoke
+        env:
+          APP_URL: ${{ steps.deploy.outputs.webapp-url }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          # Pass only when the NEW build is the one answering (not the old container)
+          for i in $(seq 1 40); do
+            RESP=$(curl -s --max-time 10 "$APP_URL/version" || true)
+            echo "Attempt $i: $RESP"
+            if echo "$RESP" | grep -q "$EXPECTED_SHA"; then
+              curl --fail --silent --show-error "$APP_URL/health"
+              echo "New version $EXPECTED_SHA is live and healthy"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "New version never became healthy"
+          exit 1
+
+      - name: Record deployed image
+        if: ${{ success() }}
+        run: |
+          echo "### Deployed image (production stage)" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ env.IMAGE }}:sha-${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+
+      # --- Automatic rollback: restore the image of the PREVIOUS commit ---
+      - name: Roll back to previous image
+        id: rollback
+        if: ${{ failure() && steps.smoke.outcome == 'failure' && github.event.before != '0000000000000000000000000000000000000000' }}
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: 'YLS-PROD'
+          publish-profile: ${{ secrets.PRODUCTION }}
+          images: ${{ env.IMAGE }}:sha-${{ github.event.before }}
+
+      - name: Verify rollback and record it
+        if: ${{ always() && steps.rollback.outcome == 'success' }}
+        env:
+          APP_URL: ${{ steps.deploy.outputs.webapp-url }}
+        run: |
+          echo "Waiting 45 seconds for Azure to boot the rolled-back container..."
+          sleep 45
+          curl --fail --silent --show-error \
+               --retry 20 --retry-delay 10 --retry-connrefused \
+               "$APP_URL/health"
+          echo "Version after rollback: $(curl -s --max-time 10 "$APP_URL/version" || true)"
+          echo "::warning::Smoke test failed. Rolled back to previous image sha-${{ github.event.before }}"
+          echo "### ROLLED BACK (production stage)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Failed commit: ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Restored image: ${{ env.IMAGE }}:sha-${{ github.event.before }}" >> "$GITHUB_STEP_SUMMARY"
