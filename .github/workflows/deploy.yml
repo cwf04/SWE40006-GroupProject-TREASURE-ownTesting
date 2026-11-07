@@ -142,7 +142,7 @@ jobs:
         if: ${{ failure() && steps.smoke.outcome == 'failure' && github.event.before != '0000000000000000000000000000000000000000' }}
         uses: azure/webapps-deploy@v3
         with:
-          app-name: 'YLS-TEST'
+          app-name: 'YLS-TEST-ownTesting'
           publish-profile: ${{ secrets.TESTING }}
           images: ${{ env.IMAGE }}:sha-${{ github.event.before }}
 
@@ -216,7 +216,7 @@ jobs:
         if: ${{ failure() && steps.smoke.outcome == 'failure' && github.event.before != '0000000000000000000000000000000000000000' }}
         uses: azure/webapps-deploy@v3
         with:
-          app-name: 'YLS-PROD'
+          app-name: 'YLS-PROD-ownTesting'
           publish-profile: ${{ secrets.PRODUCTION }}
           images: ${{ env.IMAGE }}:sha-${{ github.event.before }}
 
