@@ -105,7 +105,7 @@ jobs:
         id: deploy
         uses: azure/webapps-deploy@v3
         with:
-          app-name: 'YLS-TEST'
+          app-name: 'YLS-TEST-ownTesting'
           publish-profile: ${{ secrets.TESTING }}
           images: ${{ env.IMAGE }}:sha-${{ github.sha }}
 
@@ -180,7 +180,7 @@ jobs:
         id: deploy
         uses: azure/webapps-deploy@v3
         with:
-          app-name: 'YLS-PROD'
+          app-name: 'YLS-PROD-ownTesting'
           publish-profile: ${{ secrets.PRODUCTION }}
           images: ${{ env.IMAGE }}:sha-${{ github.sha }}
 
